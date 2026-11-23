@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Homologação: amostragem total de traces e nome do ambiente nos logs.
+resources:
+  - ../../base
+
+patches:
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: oficina-execution-config
+        namespace: oficina
+      data:
+        APP_ENV: "hml"
+        OTEL_TRACES_SAMPLER_ARG: "1.0"

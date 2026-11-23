@@ -1,0 +1,7 @@
+target/
+.git/
+.github/
+k8s/
+contracts/
+*.md
+docker-compose.yml

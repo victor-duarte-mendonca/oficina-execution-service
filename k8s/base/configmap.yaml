@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oficina-execution-config
+  namespace: oficina
+data:
+  QUARKUS_PROFILE: "prod"
+  APP_ENV: "prod"
+  JWT_ISSUER: "oficina-api"
+  AWS_REGION: "us-east-1"
+  # Tabela e filas vêm do contrato SSM no deploy (DYNAMODB_TABLE, SQS_EXECUTION_COMMANDS_URL, SQS_OS_REPLIES_URL).
+  # Mensageria desligada até as filas existirem (spec 12): o deploy liga quando os parâmetros SSM estão publicados.
+  APP_MESSAGING_ENABLED: "false"
+  DYNAMODB_CREATE_TABLE: "false"
+  OTEL_TRACES_SAMPLER_ARG: "0.2"

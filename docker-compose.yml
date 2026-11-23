@@ -1,0 +1,37 @@
+# Execution Service local, com DynamoDB e SQS do LocalStack (sem conta AWS).
+#   docker compose up --build
+#   Saúde: http://localhost:8082/q/health · OpenAPI: http://localhost:8082/q/openapi
+# A chave pública de TESTE do JWT é montada só para desenvolvimento; tokens de teste: src/test/.../TestTokens.java.
+services:
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: dynamodb,sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      retries: 20
+
+  execution:
+    build: .
+    depends_on:
+      localstack:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_OVERRIDE: http://localstack:4566
+      DYNAMODB_TABLE: oficina-local-execution
+      DYNAMODB_CREATE_TABLE: "true"
+      APP_MESSAGING_ENABLED: "true"
+      SQS_EXECUTION_COMMANDS_URL: http://localstack:4566/000000000000/oficina-local-execution-commands.fifo
+      SQS_OS_REPLIES_URL: http://localstack:4566/000000000000/oficina-local-os-saga-replies.fifo
+    volumes:
+      - ./src/test/resources/test-keys/publicKey.pem:/app/keys/publicKey.pem:ro

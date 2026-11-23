@@ -1,0 +1,17 @@
+target/
+keys/
+*.log
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Kubeconfig e artefatos de acesso ao cluster contêm credenciais: nunca commitar.
+**/kubeconfig
+**/kubeconfig-*
+
+# Credenciais locais
+.env
+*.pem
+!src/test/resources/test-keys/*.pem

@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oficina-execution
+  namespace: oficina
+# O serviço não fala com a API do Kubernetes: sem token da ServiceAccount montado.
+automountServiceAccountToken: false
+imagePullSecrets:
+  - name: ecr-registry-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oficina-execution
+  namespace: oficina
+  labels:
+    app: oficina-execution
+spec:
+  # 1 réplica (HPA 1→2): no nó único, três JVMs com 2 réplicas cada não cabem (spec 12 §3).
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: oficina-execution
+  template:
+    metadata:
+      labels:
+        app: oficina-execution
+      annotations:
+        newrelic.io/scrape: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /q/metrics
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: oficina-execution
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: oficina-execution
+          image: CHANGE_ME_ECR_EXECUTION_URL:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - configMapRef:
+                name: oficina-execution-config
+            - secretRef:
+                name: oficina-execution-secrets
+                optional: true
+          volumeMounts:
+            - name: jwt-public-key
+              mountPath: /app/keys
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "750m"
+              memory: "512Mi"
+          startupProbe:
+            httpGet:
+              path: /q/health/started
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet:
+              path: /q/health/ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /q/health/live
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        # Só a chave PÚBLICA do JWT: o Execution valida tokens, nunca os emite (menor privilégio).
+        - name: jwt-public-key
+          secret:
+            secretName: oficina-jwt-keys
+            items:
+              - key: publicKey.pem
+                path: publicKey.pem
+        - name: tmp
+          emptyDir: {}

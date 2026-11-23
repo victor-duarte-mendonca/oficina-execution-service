@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Execution Service no namespace "oficina" (criado pelos manifestos do OS Service, que sobe primeiro).
+# Base = produção; os overlays mudam só o nome do ambiente. A imagem real entra no deploy:
+#   kustomize edit set image CHANGE_ME_ECR_EXECUTION_URL=<ecr_execution_url>:<sha>
+resources:
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - networkpolicy.yaml
+
+images:
+  - name: CHANGE_ME_ECR_EXECUTION_URL
