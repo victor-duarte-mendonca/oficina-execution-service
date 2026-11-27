@@ -1,0 +1,235 @@
+name: Deploy
+
+# Deploy independente do Execution Service (spec 11 §2): imagem no ECR -> kustomize no k3s pelo tunel SSM ->
+# rollout com rollback -> smoke test -> webhook da Stripe apontado para o API Gateway.
+# homolog -> hml / homologacao ; main -> prod / producao (aprovacao do usuario).
+#
+# Sob demanda, como o OS Service (spec 06 §4.1): num push, se a stack ou a sessao AWS nao estiverem de pe, o deploy
+# e ignorado com um aviso. No disparo manual (Actions > Deploy > Run workflow), a falta de stack e erro.
+# O deploy NAO executa Terraform: cluster, filas e banco vem dos repositorios de infraestrutura (contrato SSM).
+on:
+  push:
+    branches: [main, homolog]
+    paths:
+      - "src/**"
+      - "pom.xml"
+      - "Dockerfile"
+      - "k8s/**"
+      - "scripts/**"
+      - ".github/workflows/deploy.yml"
+      - ".github/actions/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  STACK_ENV: ${{ github.ref_name == 'main' && 'prod' || 'hml' }}
+
+jobs:
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+    outputs:
+      up: ${{ steps.stack.outputs.up }}
+      image: ${{ steps.stack.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: A stack existe? (ECR do Execution publicado pelo oficina-infra-k8s)
+        id: stack
+        run: |
+          set +e
+          out="$(aws ssm get-parameter --name "/oficina/${STACK_ENV}/ecr_execution_url" \
+            --query Parameter.Value --output text 2>&1)"
+          rc=$?
+          set -e
+
+          reason=""
+          if [ "$rc" -eq 0 ]; then
+            echo "up=true" >> "$GITHUB_OUTPUT"
+            echo "image=${out}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif echo "$out" | grep -q "ParameterNotFound"; then
+            reason="a stack ${STACK_ENV} nao esta de pe (sem /oficina/${STACK_ENV}/ecr_execution_url): aplique o oficina-infra-k8s neste workspace"
+          elif echo "$out" | grep -Eq "ExpiredToken|InvalidClientTokenId|UnrecognizedClient|security token|Unable to locate credentials"; then
+            reason="sessao AWS Academy inativa ou credenciais expiradas: rode set-aws-session-secrets.sh"
+          else
+            echo "::error::Falha inesperada ao consultar o SSM:"
+            echo "$out"
+            exit 1
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "::error::Deploy manual impossivel: ${reason}"
+            exit 1
+          fi
+          echo "::notice::Deploy ignorado: ${reason}. Depois de subir a infra, dispare o workflow manualmente."
+          echo "up=false" >> "$GITHUB_OUTPUT"
+
+      - name: Login no ECR
+        if: steps.stack.outputs.up == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.stack.outputs.up == 'true'
+
+      - name: Build da imagem
+        if: steps.stack.outputs.up == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.stack.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan da imagem (Trivy)
+        if: steps.stack.outputs.up == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.stack.outputs.image }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Push para o ECR (tag = SHA do commit; nunca :latest)
+        if: steps.stack.outputs.up == 'true'
+        run: docker push "${{ steps.stack.outputs.image }}"
+
+  deploy:
+    name: deploy
+    needs: [image]
+    if: needs.image.outputs.up == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'producao' || 'homologacao' }}
+    concurrency:
+      group: deploy-execution-${{ github.ref_name == 'main' && 'prod' || 'hml' }}
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      IMAGE: ${{ needs.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secrets do environment definidos?
+        env:
+          APP_GATEWAY_KEY: ${{ secrets.APP_GATEWAY_KEY }}
+        run: |
+          missing=""
+          # Em producao o filtro do gateway nao pode ficar desligado.
+          if [ "$STACK_ENV" = "prod" ]; then
+            [ -n "${APP_GATEWAY_KEY:-}" ] || missing="$missing APP_GATEWAY_KEY"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Secrets ausentes no environment (Settings > Environments):$missing"
+            exit 1
+          fi
+
+      - name: Acesso ao cluster (tunel SSM)
+        uses: ./.github/actions/k3s-kubeconfig
+        with:
+          environment: ${{ env.STACK_ENV }}
+
+      # O namespace, a chave publica do JWT e o Ingress "/" pertencem ao OS Service, que sobe primeiro.
+      - name: Pre-requisitos do cluster (OS Service ja publicado)
+        run: |
+          if ! kubectl get namespace oficina > /dev/null 2>&1 \
+             || ! kubectl -n oficina get secret oficina-jwt-keys > /dev/null 2>&1; then
+            echo "::error::Namespace 'oficina' ou secret 'oficina-jwt-keys' ausentes: faca o deploy do oficina-app neste ambiente antes."
+            exit 1
+          fi
+
+      - name: Secret de pull do ECR (token de 12 h, renovado a cada deploy)
+        run: |
+          registry="${IMAGE%%/*}"
+          kubectl create secret docker-registry ecr-registry-secret \
+            --namespace oficina \
+            --docker-server="$registry" \
+            --docker-username=AWS \
+            --docker-password="$(aws ecr get-login-password --region "$AWS_REGION")" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Secret do Execution (tabela e filas vem do SSM; nada colado a mao)
+        env:
+          APP_GATEWAY_KEY: ${{ secrets.APP_GATEWAY_KEY }}
+        run: |
+          ssm() {
+            aws ssm get-parameter --name "/oficina/${STACK_ENV}/$1" \
+              --query Parameter.Value --output text 2> /dev/null
+          }
+
+          # A tabela e obrigatoria: sem ela o servico nao tem onde gravar (o oficina-infra-database publica o nome).
+          if ! table="$(ssm execution/dynamodb_table)"; then
+            echo "::error::Sem /oficina/${STACK_ENV}/execution/dynamodb_table: aplique o oficina-infra-database neste workspace antes."
+            exit 1
+          fi
+
+          # Mensageria so liga quando as duas filas existem (spec 12); sem elas o servico sobe, mas nao orquestra a Saga.
+          messaging="false"
+          queue_args=()
+          if commands_url="$(ssm sqs/execution_commands_url)" && replies_url="$(ssm sqs/os_replies_url)"; then
+            messaging="true"
+            queue_args+=(--from-literal=SQS_EXECUTION_COMMANDS_URL="$commands_url"
+                         --from-literal=SQS_OS_REPLIES_URL="$replies_url")
+          else
+            echo "::warning::Filas SQS ainda nao publicadas: APP_MESSAGING_ENABLED=false."
+          fi
+
+          # As credenciais da AWS (DynamoDB/SQS) vem do IMDS da EC2 (LabRole, ADR 0022): nenhuma chave no Secret.
+          # O Secret vem depois do ConfigMap no envFrom: APP_MESSAGING_ENABLED daqui prevalece.
+          kubectl create secret generic oficina-execution-secrets \
+            --namespace oficina \
+            --from-literal=DYNAMODB_TABLE="$table" \
+            --from-literal=APP_GATEWAY_KEY="${APP_GATEWAY_KEY:-}" \
+            --from-literal=APP_MESSAGING_ENABLED="$messaging" \
+            "${queue_args[@]}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Aplicar manifestos (kustomize)
+        id: apply
+        run: |
+          overlay="k8s/overlays/${STACK_ENV}"
+          ecr_repo="${IMAGE%:*}"
+          {
+            echo ""
+            echo "images:"
+            echo "  - name: CHANGE_ME_ECR_EXECUTION_URL"
+            echo "    newName: ${ecr_repo}"
+            echo "    newTag: ${GITHUB_SHA}"
+          } >> "${overlay}/kustomization.yaml"
+          kubectl apply -k "$overlay"
+
+      - name: Aguardar rollout
+        run: kubectl -n oficina rollout status deployment/oficina-execution --timeout=300s
+
+      - name: Smoke test (port-forward do Service)
+        run: bash scripts/smoke-test.sh
+
+      - name: Rollback automatico se o rollout ou o smoke test falharem
+        if: failure() && steps.apply.conclusion == 'success'
+        run: |
+          echo "::warning::Deploy falhou: revertendo para a revisao anterior (no primeiro deploy nao ha revisao anterior)."
+          kubectl -n oficina rollout undo deployment/oficina-execution || true
+          kubectl -n oficina get pods -l app=oficina-execution -o wide || true
+          kubectl -n oficina describe deployment/oficina-execution || true
+          kubectl -n oficina logs -l app=oficina-execution --tail=100 --all-containers || true
+
+      - name: Resumo
+        if: success()
+        run: |
+          {
+            echo "### Execution Service publicado — ${STACK_ENV}"
+            echo ""
+            echo "- Imagem: \`${IMAGE}\`"
+            echo "- Lembrete: destrua a stack ao fim da sessao (auth-lambda -> infra-database -> infra-k8s)."
+          } >> "$GITHUB_STEP_SUMMARY"
