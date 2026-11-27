@@ -115,8 +115,24 @@ O `mvn verify` reprova abaixo de **80% de linhas e 70% de ramos** do serviço (e
 ## CI/CD
 
 `.github/workflows/ci.yml`: `build-test` (testes + gate), `docker-build` (imagem + Trivy) e `workflow-lint`
-(actionlint + kustomize). O deploy no k3s (`kubectl apply -k k8s/overlays/<env>` pelo túnel SSM, como no OS)
-entra quando a infraestrutura da tabela e das filas existir (spec 12). Análise SonarCloud: spec 10.
+(actionlint + kustomize). Análise SonarCloud: spec 10.
+
+`.github/workflows/deploy.yml` (independente dos outros serviços; `homolog` → `hml`/`homologacao`, `main` → `prod`/`producao`
+com aprovação manual):
+
+```
+image   consulta /oficina/<env>/ecr_execution_url no SSM → build → Trivy (CRITICAL corrigível) → push (tag = SHA)
+deploy  túnel SSM ao k3s → Secret (tabela e filas lidas do SSM) → kubectl apply -k → rollout status
+        → smoke test (scripts/smoke-test.sh) → rollback automático se falhar
+```
+
+- **Sob demanda**: sem stack ou sem sessão AWS, o push passa verde com um aviso; o disparo manual (*Run workflow*) trata a falta como erro. O deploy não executa Terraform.
+- **Pré-requisitos**: o `oficina-app` já publicado no ambiente (namespace e chave pública do JWT); parâmetros SSM `ecr_execution_url`, `execution/dynamodb_table`, `sqs/execution_commands_url`, `sqs/os_replies_url`.
+- **Environment** (`homologacao`/`producao`): secret `APP_GATEWAY_KEY` (obrigatório em prod). Os `AWS_*` são da organização e expiram com a sessão do Academy.
+- **Credenciais da AWS no pod**: vêm do IMDS da EC2 (LabRole, ADR 0022); nenhuma chave entra no Secret.
+- **Rollback**: `kubectl rollout undo` se o rollout ou o smoke test falharem; o rollback de um serviço não afeta os outros.
+- **Ordem numa mudança de contrato**: consumidor primeiro, produtor depois; remoção só numa versão posterior.
+- **Reproduzir localmente**: `mvn verify` (testes + gate JaCoCo), `docker build .`, `shellcheck scripts/*.sh`, `kubectl kustomize k8s/overlays/hml`.
 
 ## Segurança
 
